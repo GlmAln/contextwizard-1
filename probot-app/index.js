@@ -1,5 +1,9 @@
+// probot-app/index.js
 const axios = require("axios");
 
+/**
+ * Call backend with prepared payload.
+ */
 async function callBackend(context, payloadForBackend) {
   const backendUrl = process.env.BACKEND_URL;
   if (!backendUrl) {
@@ -24,10 +28,46 @@ async function callBackend(context, payloadForBackend) {
   }
 }
 
-// helper for files
-async function getPrFiles(context, owner, repo, prNumber) {
+/**
+ * Fetch full file content for a given ref (commit SHA / branch).
+ */
+async function getFileContent(context, owner, repo, path, ref) {
+  try {
+    const res = await context.octokit.repos.getContent({
+      owner,
+      repo,
+      path,
+      ref
+    });
+
+    const data = res.data;
+
+    // If it's a directory (array) or something unexpected, skip
+    if (Array.isArray(data) || !data.content) {
+      return null;
+    }
+
+    const encoding = data.encoding || "base64";
+    const buff = Buffer.from(data.content, encoding);
+    return buff.toString("utf8");
+  } catch (err) {
+    context.log.error(
+      { err, path, ref },
+      "Failed to fetch file content from GitHub"
+    );
+    return null;
+  }
+}
+
+/**
+ * Get changed files for a PR, including:
+ *  - metadata (status, additions, deletions, patch)
+ *  - full content before and after change (base_content/head_content)
+ */
+async function getPrFiles(context, owner, repo, prNumber, baseSha, headSha) {
   const files = [];
   let page = 1;
+
   while (true) {
     const res = await context.octokit.pulls.listFiles({
       owner,
@@ -36,20 +76,40 @@ async function getPrFiles(context, owner, repo, prNumber) {
       per_page: 100,
       page
     });
+
     if (!res.data.length) break;
+
     for (const f of res.data) {
+      const filename = f.filename;
+
+      // For added files, there is no "before" content
+      const baseContent =
+        f.status === "added"
+          ? null
+          : await getFileContent(context, owner, repo, filename, baseSha);
+
+      // For removed files, there is no "after" content
+      const headContent =
+        f.status === "removed"
+          ? null
+          : await getFileContent(context, owner, repo, filename, headSha);
+
       files.push({
-        filename: f.filename,
+        filename,
         status: f.status,
         additions: f.additions,
         deletions: f.deletions,
         changes: f.changes,
-        patch: f.patch // unified diff (contains before & after)
+        patch: f.patch || null, // unified diff (contains before & after)
+        base_content: baseContent,
+        head_content: headContent
       });
     }
+
     if (res.data.length < 100) break;
     page += 1;
   }
+
   return files;
 }
 
@@ -84,7 +144,18 @@ module.exports = (app) => {
       const owner = repo.owner.login;
       const repoName = repo.name;
       const prNumber = pr.number;
-      const files = await getPrFiles(context, owner, repoName, prNumber);
+
+      const baseSha = pr.base.sha;
+      const headSha = pr.head.sha;
+
+      const files = await getPrFiles(
+        context,
+        owner,
+        repoName,
+        prNumber,
+        baseSha,
+        headSha
+      );
 
       const payloadForBackend = {
         kind: "review",
@@ -109,6 +180,7 @@ module.exports = (app) => {
       const commentBody = await callBackend(context, payloadForBackend);
       if (!commentBody) return;
 
+      // Reply in PR conversation as a normal PR comment
       await context.octokit.issues.createComment({
         owner,
         repo: repoName,
@@ -120,7 +192,7 @@ module.exports = (app) => {
         { err },
         "Error while handling pull_request_review.submitted"
       );
-      // don’t rethrow – we want Probot to return 200 instead of 500
+      // do not rethrow – we want Probot to return 200 instead of 500
     }
   });
 
@@ -145,7 +217,18 @@ module.exports = (app) => {
       const owner = repo.owner.login;
       const repoName = repo.name;
       const prNumber = pr.number;
-      const files = await getPrFiles(context, owner, repoName, prNumber);
+
+      const baseSha = pr.base.sha;
+      const headSha = pr.head.sha;
+
+      const files = await getPrFiles(
+        context,
+        owner,
+        repoName,
+        prNumber,
+        baseSha,
+        headSha
+      );
 
       const payloadForBackend = {
         kind: "review_comment",
@@ -170,6 +253,7 @@ module.exports = (app) => {
       const replyBody = await callBackend(context, payloadForBackend);
       if (!replyBody) return;
 
+      // Reply to that specific inline comment thread
       await context.octokit.pulls.createReplyForReviewComment({
         owner,
         repo: repoName,
@@ -184,7 +268,7 @@ module.exports = (app) => {
         { err },
         "Error while handling pull_request_review_comment.created"
       );
-      // don’t rethrow
+      // do not rethrow
     }
   });
 };
