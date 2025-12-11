@@ -1,40 +1,13 @@
-# ======================
-# Node / Probot
-# ======================
-node_modules/
-npm-debug.log
-yarn-debug.log
-yarn-error.log
-
-# Probot private key (very important!)
-*.pem
-
-# Local environment variables
-.env
-.probot/.env
-backend/.env
-probot-app/.env
-
-# OS junk
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# ======================
-# Python / FastAPI backend
-# ======================
-backend/__pycache__/
-backend/*.pyc
-backend/*.pyo
-backend/.python-version
-
-# Python virtual environment
-venv/
+# Python
 backend/venv/
+backend/__pycache__/
+*.pyc
 
-# Uvicorn reload artifacts
-backend/.pytest_cache/
-backend/.ruff_cache/
-backend/.mypy_cache/
+# Node
+probot-app/node_modules/
+
+# Environment files
+# probot-app/.env
+
+# OS/files
+.DS_Store
