@@ -139,6 +139,58 @@ async function buildReviewCommentPayload(context) {
   };
 }
 
+
+/**
+ * Build backend payload for a submitted review event (top-level comment)
+ */
+async function buildReviewPayload(context) {
+  const review = context.payload.review;
+  const pr = context.payload.pull_request;
+  const repo = context.payload.repository;
+
+  const reviewBodyOriginal = (review.body || "").trim();
+  
+  // A review with no body is usually just an APPROVED status, which we can ignore
+  if (!reviewBodyOriginal) return null;
+
+  const owner = repo.owner.login;
+  const repoName = repo.name;
+  const prNumber = pr.number;
+
+  const files = await getPrFiles(context, owner, repoName, prNumber);
+
+  return {
+    kind: "review",
+
+    // review-level fields
+    review_body: reviewBodyOriginal,
+    review_state: review.state,
+
+    // inline comment fields (unused for this kind)
+    comment_body: null,
+    comment_path: null,
+    comment_diff_hunk: null,
+    comment_position: null,
+    comment_id: null,
+
+    // shared metadata
+    reviewer_login: review.user && review.user.login,
+    pr_number: prNumber,
+    pr_title: pr.title,
+    pr_body: pr.body,
+    pr_author_login: pr.user && pr.user.login,
+    repo_full_name: repo.full_name,
+    repo_owner: owner,
+    repo_name: repoName,
+
+    // diff context
+    files,
+
+    review_comments: null
+  };
+}
+
+
 /**
  * Post reply to the inline comment thread
  */
@@ -153,13 +205,24 @@ async function replyToInlineComment(context, owner, repoName, prNumber, commentI
 }
 
 /**
+ * Post reply to the top-level PR thread (for reviews)
+ */
+async function replyToPrThread(context, owner, repoName, prNumber, body) {
+  await context.octokit.issues.createComment({
+    owner,
+    repo: repoName,
+    issue_number: prNumber,
+    body
+  });
+}
+
+/**
  * Main Probot app
  */
 module.exports = (app) => {
-  // We intentionally IGNORE pull_request_review.submitted for now to avoid double-processing.
-  // (When you re-enable later, add a separate handler with its own logic.)
-
-  // Handle single inline review comment on “Files changed”
+  // ----------------------------------------------
+  // 1. Handle single inline review comment
+  // ----------------------------------------------
   app.on("pull_request_review_comment.created", async (context) => {
     try {
       if (isFromBot(context)) {
@@ -192,6 +255,51 @@ module.exports = (app) => {
       );
     } catch (err) {
       context.log.error({ err }, "Error while handling pull_request_review_comment.created");
+    }
+  });
+
+
+  // ----------------------------------------------
+  // 2. Handle submitted Pull Request Review (top-level comment)
+  // ----------------------------------------------
+  app.on("pull_request_review.submitted", async (context) => {
+    try {
+      if (isFromBot(context)) {
+        context.log.info("Skipping event from bot sender.");
+        return;
+      }
+
+      const reviewBody = context.payload.review.body;
+      if (!reviewBody || reviewBody.trim() === "") {
+        context.log.info("Skipping review with empty body.");
+        return;
+      }
+
+      const payloadForBackend = await buildReviewPayload(context);
+      if (!payloadForBackend) {
+        context.log.info("Review payload construction failed, skipping.");
+        return;
+      }
+
+      const replyBody = await callBackend(context, payloadForBackend);
+      if (!replyBody) return;
+
+      const repo = context.payload.repository;
+      const pr = context.payload.pull_request;
+      
+      const owner = repo.owner.login;
+      const repoName = repo.name;
+      const prNumber = pr.number;
+
+      // Post the reply as a new top-level comment on the PR thread
+      await replyToPrThread(context, owner, repoName, prNumber, replyBody);
+
+      context.log.info(
+        { pr: prNumber, review_id: context.payload.review.id },
+        "Replied to submitted review."
+      );
+    } catch (err) {
+      context.log.error({ err }, "Error while handling pull_request_review.submitted");
     }
   });
 };
