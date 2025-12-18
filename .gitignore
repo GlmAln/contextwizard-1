@@ -1,11 +1,13 @@
 # Python
 backend/venv/
 backend/__pycache__/
+backend/.env
 *.pyc
 
 # Node
 probot-app/node_modules/
-
+probot-app/package-lock.json
+probot-app/.env
 # Environment files
 # probot-app/.env
 

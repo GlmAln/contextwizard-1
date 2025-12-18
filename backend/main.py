@@ -1,5 +1,6 @@
 # backend/main.py
 from dotenv import load_dotenv
+
 load_dotenv()
 
 from typing import List, Optional, Literal
@@ -9,7 +10,9 @@ import os
 import json
 import sys
 
+import anyio
 from google import genai
+
 types = genai.types  # alias for convenience
 
 app = FastAPI()
@@ -72,7 +75,7 @@ class BackendResponse(BaseModel):
 
 
 # ----------------------------
-# Gemini structured output model
+# Gemini structured output models
 # ----------------------------
 Category = Literal[
     "PRAISE",
@@ -80,7 +83,7 @@ Category = Literal[
     "BAD_CHANGE",
     "GOOD_QUESTION",
     "BAD_QUESTION",
-    "UNKNOWN",  # safety fallback
+    "UNKNOWN",
 ]
 
 
@@ -92,11 +95,25 @@ class Classification(BaseModel):
     short_reason: str = Field(..., description="One short sentence. No chain-of-thought.")
 
 
+class ClarifiedQuestion(BaseModel):
+    clarified_question: str = Field(..., description="A rewritten, clarified version of the original question.")
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    short_reason: str = Field(..., description="One short sentence on what was ambiguous / what you clarified.")
+
+
+class ClarifiedChange(BaseModel):
+    clarified_request: str = Field(
+        ...,
+        description="A rewritten, clarified change request. Must be actionable but may contain placeholders like <which function?>.",
+    )
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    short_reason: str = Field(..., description="One short sentence on what was unclear / what you clarified.")
+
+
 # ----------------------------
 # Helpers
 # ----------------------------
 def get_client() -> genai.Client:
-    """Returns the synchronous Gemini client."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
@@ -110,9 +127,6 @@ def clip(s: Optional[str], n: int) -> str:
 
 
 def build_llm_context(payload: ReviewPayload) -> str:
-    """
-    Compact, high-signal context for classification and suggestion.
-    """
     pr_title = payload.pr_title or ""
     pr_body = clip(payload.pr_body, 1200)
 
@@ -141,7 +155,6 @@ Original comment:
 Diff hunk (truncated):
 {hunk}
 """.rstrip()
-
     else:
         review_text = payload.review_body or ""
         base += f"""
@@ -161,7 +174,6 @@ Review body:
                     f"by {c.user_login}: {clip(c.body, 400)}\n"
                 )
 
-    # Include changed files + patches (truncated)
     files = payload.files or []
     if files:
         base += f"\n\nChanged files: {len(files)} (showing up to 6 patches, truncated)\n"
@@ -174,72 +186,55 @@ Review body:
 
     return base.strip()
 
-# NOTE: This function is SYNCHRONOUS (no 'async')
+
+def extract_first_fenced_code_block(text: str) -> str:
+    """
+    Return ONLY the first fenced code block (```...```).
+    If none found, wrap whole text in a plain ``` block as a fallback.
+    """
+    if not text:
+        return "```diff\n```"
+    start = text.find("```")
+    if start == -1:
+        return f"```\n{text.strip()}\n```"
+    end = text.find("```", start + 3)
+    if end == -1:
+        return text[start:].strip()
+    end = text.find("```", end)
+    return text[start : end + 3].strip()
+
+
+# ----------------------------
+# Gemini calls (sync)
+# ----------------------------
 def classify_with_gemini(payload: ReviewPayload) -> Classification:
-    client = get_client() # Get synchronous client
+    client = get_client()
     model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-    # The system instructions string for classification
     system_instructions = """
 You are a code review assistant that classifies a GitHub PR inline review comment
 into exactly ONE category.
 
 Decision priority:
-1) First determine the INTENT of the comment:
-    - praise
-    - question
-    - request to change code
-2) Then determine whether the intent is CLEAR (good) or UNCLEAR (bad).
+1) Determine intent: praise / question / request change
+2) Determine clarity: good / bad
 
-Categories:
-1) PRAISE:
-    - Only positive reaction.
-    - No actionable request.
+Categories: PRAISE, GOOD_CHANGE, BAD_CHANGE, GOOD_QUESTION, BAD_QUESTION
 
-2) GOOD_CHANGE:
-    - Clear, actionable request to change code.
+Rules:
+- "bad" = unclear/underspecified (not rude)
+- needs_reply true ONLY for: GOOD_CHANGE, BAD_CHANGE, BAD_QUESTION
+- needs_clarification true ONLY for: BAD_CHANGE, BAD_QUESTION
+- Unknown intent -> UNKNOWN with low confidence
 
-3) BAD_CHANGE:
-    - A request to change code, but unclear, underspecified, or poorly explained.
-    - Needs clarification before code can be suggested.
-
-4) GOOD_QUESTION:
-    - A clear question.
-    - No action required by the bot.
-
-5) BAD_QUESTION:
-    - A question, but unclear, ambiguous, or underspecified.
-    - Bot should ask clarifying questions.
-
-Important notes:
-- "bad" means unclear, ambiguous, or underspecified — NOT rude or toxic.
-- Informal language, slang, sarcasm, emojis, or non-English text
-    does NOT automatically make a comment bad.
-- Short comments are allowed to be GOOD if intent is still clear.
-- needs_reply must be true ONLY for:
-    GOOD_CHANGE, BAD_CHANGE, BAD_QUESTION.
-- needs_clarification must be true ONLY for:
-    BAD_CHANGE, BAD_QUESTION.
-- If intent cannot be determined, use category=UNKNOWN with low confidence.
-
-Return ONLY valid JSON that matches the provided schema.
+Return ONLY valid JSON for the schema.
 """.strip()
 
-    ctx = build_llm_context(payload)    
+    ctx = build_llm_context(payload)
 
-    # NOTE: No 'await' keyword here.
     resp = client.models.generate_content(
         model=model,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part(
-                        text=f"{system_instructions}\n\nCONTEXT:\n{ctx}"
-                    )
-                ],
-            )
-        ],
+        contents=[types.Content(role="user", parts=[types.Part(text=f"{system_instructions}\n\nCONTEXT:\n{ctx}")])],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=Classification,
@@ -247,69 +242,131 @@ Return ONLY valid JSON that matches the provided schema.
         ),
     )
 
-    # Structured output parsing (safe fallback)
     data = getattr(resp, "parsed", None)
     if data is None:
         data = json.loads(resp.text)
 
     return Classification.model_validate(data)
 
-# NOTE: This function is SYNCHRONOUS (no 'async')
-def generate_code_suggestion(payload: ReviewPayload, cls: Classification) -> str:
-    client = get_client() # Get synchronous client
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash") # Use a powerful model for code
 
-    # The system instructions string for code suggestion
-    system_instructions = f"""
-You are an expert GitHub code review assistant. Your task is to provide a helpful, actionable code suggestion in response to a peer review comment.
+def clarify_bad_question(payload: ReviewPayload, cls: Classification) -> ClarifiedQuestion:
+    client = get_client()
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-Constraints:
-1. **Analyze the original comment** (provided below) and the surrounding **diff hunk**.
-2. **Focus ONLY on the requested change.**
-3. **If possible, provide the entire suggested file content or a complete function/class block that includes the fix.**
-4. **Your final output MUST be a clean, direct Markdown code block.** Do not include any introductory or explanatory text outside the code block.
+    system_instructions = """
+Rewrite an unclear PR question into a clarified question.
 
-Reviewer's Intent (from Classification): {cls.category} - {cls.short_reason}
+Rules:
+- Output must match the JSON schema.
+- 1–2 short sentences max, end with "?".
+- Do NOT answer. Do NOT invent facts.
+- Use placeholders if missing: "<which file?>", "<which function?>", "<expected behavior?>"
 """.strip()
 
-    # Reuse the context builder, but focus the prompt on the necessary fix
     ctx = build_llm_context(payload)
 
-    # The full prompt string for code suggestion
+    resp = client.models.generate_content(
+        model=model,
+        contents=[types.Content(role="user", parts=[types.Part(text=f"{system_instructions}\n\nCONTEXT:\n{ctx}")])],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ClarifiedQuestion,
+            temperature=0.2,
+        ),
+    )
+
+    data = getattr(resp, "parsed", None)
+    if data is None:
+        data = json.loads(resp.text)
+
+    return ClarifiedQuestion.model_validate(data)
+
+
+def clarify_bad_change(payload: ReviewPayload, cls: Classification) -> ClarifiedChange:
+    client = get_client()
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+    system_instructions = """
+Rewrite an unclear PR change request into a clarified, actionable request.
+
+Rules:
+- Output must match the JSON schema.
+- Do NOT propose code. Do NOT invent facts.
+- "clarified_request" must be 1–2 short sentences max.
+- Use placeholders if missing: "<which file?>", "<which function?>", "<acceptance criteria?>"
+""".strip()
+
+    ctx = build_llm_context(payload)
+
+    resp = client.models.generate_content(
+        model=model,
+        contents=[types.Content(role="user", parts=[types.Part(text=f"{system_instructions}\n\nCONTEXT:\n{ctx}")])],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ClarifiedChange,
+            temperature=0.2,
+        ),
+    )
+
+    data = getattr(resp, "parsed", None)
+    if data is None:
+        data = json.loads(resp.text)
+
+    return ClarifiedChange.model_validate(data)
+
+
+def generate_code_suggestion(
+    payload: ReviewPayload,
+    cls: Classification,
+    reviewer_comment_override: Optional[str] = None,
+) -> str:
+    client = get_client()
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    reviewer_comment = (reviewer_comment_override or payload.comment_body or payload.review_body or "").strip()
+    ctx = build_llm_context(payload)
+
+    system_instructions = f"""
+You are a GitHub code review assistant.
+
+Goal: produce a SHORT, STRICT code suggestion for the requested change.
+
+Hard rules:
+- Output MUST be ONLY ONE fenced code block and NOTHING else.
+- The code block language MUST be either:
+  1) ```diff  (preferred)
+  2) ```suggestion  (only if diff isn't possible)
+- Keep it minimal: change ONLY the smallest relevant lines.
+- Do NOT rewrite whole files. Do NOT include unrelated context.
+- If unsure, output a SMALL diff that adds TODOs/placeholders rather than guessing.
+
+Comment to satisfy (source of truth):
+{reviewer_comment}
+""".strip()
+
     prompt = f"""
 {system_instructions}
 
-CONTEXT:
+CONTEXT (reference only):
 ---
 {ctx}
 ---
 
-Your task: Based on the "Original comment" and the "Diff hunk" in the context above, provide the corrected/suggested code.
+Return ONLY the single fenced code block now.
+""".strip()
 
-Return ONLY the code block in Markdown format.
-"""
-
-    # NOTE: No 'await' keyword here.
     resp = client.models.generate_content(
         model=model,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part(text=prompt)
-                ],
-            )
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0.3,
-        ),
+        contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+        config=types.GenerateContentConfig(temperature=0.2),
     )
-    
-    # Strip any potential leading/trailing text outside the code block
-    # and return the generated text.
-    return resp.text.strip()
+
+    return extract_first_fenced_code_block((resp.text or "").strip())
 
 
+# ----------------------------
+# Formatting helpers
+# ----------------------------
 def format_debug_comment(payload: ReviewPayload, cls: Classification) -> str:
     where = "review" if payload.kind == "review" else "inline comment"
     original_text = payload.review_body if payload.kind == "review" else payload.comment_body
@@ -332,25 +389,60 @@ def format_debug_comment(payload: ReviewPayload, cls: Classification) -> str:
     return "\n".join(lines).strip()
 
 
+def format_clarification_question_comment(payload: ReviewPayload, cls: Classification, cq: ClarifiedQuestion) -> str:
+    original_text = (payload.comment_body or payload.review_body or "").strip()
+
+    lines = [
+        "❓ **ContextWizard (clarified question)**",
+        f"- category: **{cls.category}**",
+        f"- classification_confidence: `{cls.confidence:.2f}`",
+        f"- rewrite_confidence: `{cq.confidence:.2f}`",
+        f"- reason: {cls.short_reason}",
+        f"- rewrite_note: {cq.short_reason}",
+        "",
+        "**Original question:**",
+        f"> {(original_text[:800] + '…') if len(original_text) > 800 else original_text}".replace("\n", "\n> "),
+        "",
+        "**Proposed clarified version:**",
+        f"> {cq.clarified_question}".replace("\n", "\n> "),
+    ]
+    return "\n".join(lines).strip()
+
+
+def format_bad_change_with_suggestion_comment(
+    cls: Classification,
+    clarified_request: str,
+    suggestion_block: str,
+) -> str:
+    # You asked for exactly:
+    # 1- clarified version
+    # 2- suggested code change (current strict block)
+    return "\n".join(
+        [
+            f"1- **clarified version:** {clarified_request}",
+            "2- **suggested code change:**",
+            suggestion_block.strip(),
+        ]
+    ).strip()
+
+
 # ----------------------------
 # FastAPI route
 # ----------------------------
 @app.post("/analyze-review", response_model=BackendResponse)
 async def analyze_review(payload: ReviewPayload):
-    # Print payload for debug (keep this)
     print("==== Incoming payload ====", file=sys.stderr)
     try:
         print(json.dumps(payload.model_dump(), indent=2), file=sys.stderr)
     except Exception:
-        print(json.dumps(payload.dict(), indent=2), file=sys.stderr) 
+        print(json.dumps(payload.dict(), indent=2), file=sys.stderr)
     print("==========================", file=sys.stderr)
 
-    # 1. Classify the comment/review
+    # 1) Classify
+    print("Classifying with Gemini...")
     try:
-        # MUST use 'await' here to run the synchronous helper in a thread pool
-        cls = classify_with_gemini(payload)
+        cls = await anyio.to_thread.run_sync(classify_with_gemini, payload)
     except Exception as e:
-        # Fallback debug comment on classification failure
         cls = Classification(
             category="UNKNOWN",
             needs_reply=True,
@@ -358,47 +450,66 @@ async def analyze_review(payload: ReviewPayload):
             confidence=0.0,
             short_reason=f"Gemini classification failed: {type(e).__name__}: {str(e)[:160]}",
         )
-        # If classification fails, return the error immediately
-        final_comment_body = format_debug_comment(payload, cls)
-        return BackendResponse(comment=final_comment_body.strip())
+        return BackendResponse(comment=format_debug_comment(payload, cls))
 
-    final_comment_body = ""
+    # Only do follow-up actions for inline comments
+    if payload.kind != "review_comment":
+        return BackendResponse(comment=format_debug_comment(payload, cls))
 
-    # 2. Check if a code suggestion is warranted
-    # Only attempt code suggestion for inline comments, NOT full reviews.
-    if payload.kind == "review_comment" and cls.category == "GOOD_CHANGE" and cls.confidence >= 0.7:
+    # 2) GOOD_CHANGE -> strict short code suggestion (diff/suggestion only)
+    if cls.category == "GOOD_CHANGE" and cls.confidence >= 0.7:
+        print("Generating good change with Gemini...")
         try:
-            # MUST use 'await' here to run the synchronous helper in a thread pool
-            suggestion = generate_code_suggestion(payload, cls)
-            
-            # Format the final comment body for GitHub
-            final_comment_body = f"""
-**🤖 Code Suggestion ({cls.category} - {cls.confidence:.2f})**
-
-_Reviewer intent: {cls.short_reason}_
-
-Here is a suggested implementation for the requested change:
-
-{suggestion}
-
----
-_(Generated by Gemini)_
-"""
+            suggestion_block = await anyio.to_thread.run_sync(generate_code_suggestion, payload, cls, None)
+            return BackendResponse(comment=suggestion_block)
         except Exception as e:
-            # Fallback if code generation fails
-            final_comment_body = format_debug_comment(
-                payload, 
-                Classification(
-                    category="UNKNOWN",
-                    needs_reply=True,
-                    needs_clarification=False,
-                    confidence=0.0,
-                    short_reason=f"Suggestion generation failed: {type(e).__name__}: {str(e)[:160]}",
-                )
+            fallback = Classification(
+                category="UNKNOWN",
+                needs_reply=True,
+                needs_clarification=False,
+                confidence=0.0,
+                short_reason=f"Suggestion generation failed: {type(e).__name__}: {str(e)[:160]}",
             )
-    else:
-        # For full reviews, or other categories/low confidence inline comments, return the classification debug comment
-        final_comment_body = format_debug_comment(payload, cls)
+            return BackendResponse(comment=format_debug_comment(payload, fallback))
 
+    # 3) BAD_QUESTION -> clarified question message
+    if cls.category == "BAD_QUESTION" and cls.confidence >= 0.55:
+        print("Clarifying bad question with Gemini...")
+        try:
+            cq = await anyio.to_thread.run_sync(clarify_bad_question, payload, cls)
+            return BackendResponse(comment=format_clarification_question_comment(payload, cls, cq))
+        except Exception as e:
+            fallback = Classification(
+                category="UNKNOWN",
+                needs_reply=True,
+                needs_clarification=False,
+                confidence=0.0,
+                short_reason=f"Question clarification failed: {type(e).__name__}: {str(e)[:160]}",
+            )
+            return BackendResponse(comment=format_debug_comment(payload, fallback))
 
-    return BackendResponse(comment=final_comment_body.strip())
+    # 4) BAD_CHANGE -> clarify -> code suggestion -> reply includes BOTH (your required format)
+    if cls.category == "BAD_CHANGE" and cls.confidence >= 0.55:
+        print("Clarifying bad change and generating suggestion with Gemini...")
+        try:
+            cc = await anyio.to_thread.run_sync(clarify_bad_change, payload, cls)
+            suggestion_block = await anyio.to_thread.run_sync(
+                generate_code_suggestion,
+                payload,
+                cls,
+                cc.clarified_request,
+            )
+            body = format_bad_change_with_suggestion_comment(cls, cc.clarified_request, suggestion_block)
+            return BackendResponse(comment=body)
+        except Exception as e:
+            fallback = Classification(
+                category="UNKNOWN",
+                needs_reply=True,
+                needs_clarification=False,
+                confidence=0.0,
+                short_reason=f"BAD_CHANGE clarification/suggestion failed: {type(e).__name__}: {str(e)[:160]}",
+            )
+            return BackendResponse(comment=format_debug_comment(payload, fallback))
+
+    # 5) Default: classification debug comment
+    return BackendResponse(comment=format_debug_comment(payload, cls))
