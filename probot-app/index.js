@@ -149,7 +149,7 @@ async function buildReviewPayload(context) {
   const repo = context.payload.repository;
 
   const reviewBodyOriginal = (review.body || "").trim();
-  
+
   // A review with no body is usually just an APPROVED status, which we can ignore
   if (!reviewBodyOriginal) return null;
 
@@ -225,39 +225,33 @@ module.exports = (app) => {
   // ----------------------------------------------
   app.on("pull_request_review_comment.created", async (context) => {
     try {
-      if (isFromBot(context)) {
-        context.log.info("Skipping event from bot sender.");
-        return;
-      }
+      console.log("Received pull_request_review_comment.created event");
+      if (isFromBot(context)) return;
+
+      const commentBody = (context.payload.comment.body || "").trim();
+      const isWizardCmd = commentBody.startsWith("/wizard-review");
 
       const payloadForBackend = await buildReviewCommentPayload(context);
-      if (!payloadForBackend) {
-        context.log.info("Inline comment body empty, skipping.");
-        return;
+      if (!payloadForBackend) return;
+
+      if (isWizardCmd) {
+        console.log("Detected /wizard-review command in inline comment");
+        payloadForBackend.kind = "wizard_review_command";
       }
 
       const replyBody = await callBackend(context, payloadForBackend);
       if (!replyBody) return;
 
-      const repo = context.payload.repository;
-      const pr = context.payload.pull_request;
-      const comment = context.payload.comment;
+      const owner = payloadForBackend.repo_owner;
+      const repoName = payloadForBackend.repo_name;
+      const prNumber = payloadForBackend.pr_number;
 
-      const owner = repo.owner.login;
-      const repoName = repo.name;
-      const prNumber = pr.number;
+      await replyToInlineComment(context, owner, repoName, prNumber, context.payload.comment.id, replyBody);
 
-      await replyToInlineComment(context, owner, repoName, prNumber, comment.id, replyBody);
-
-      context.log.info(
-        { pr: prNumber, comment_id: comment.id },
-        "Replied to inline review comment."
-      );
     } catch (err) {
-      context.log.error({ err }, "Error while handling pull_request_review_comment.created");
+      context.log.error({ err }, "Error in wizard-review trigger");
     }
   });
-
 
   // ----------------------------------------------
   // 2. Handle submitted Pull Request Review (top-level comment)
@@ -286,7 +280,7 @@ module.exports = (app) => {
 
       const repo = context.payload.repository;
       const pr = context.payload.pull_request;
-      
+
       const owner = repo.owner.login;
       const repoName = repo.name;
       const prNumber = pr.number;

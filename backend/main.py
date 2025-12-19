@@ -559,6 +559,14 @@ def format_bad_change_with_suggestion_comment(
 # ----------------------------
 @app.post("/analyze-review", response_model=BackendResponse)
 async def analyze_review(payload: ReviewPayload):
+    print(f"Processing kind: {payload.kind} for PR #{payload.pr_number}", file=sys.stderr)
+    if payload.kind == "wizard_review_command":
+        try:
+            suggestions = await anyio.to_thread.run_sync(run_wizard_full_review, payload)
+            return BackendResponse(comment=f"🧙‍♂️ **Wizard Review Suggestions**\n\n{suggestions}")
+        except Exception as e:
+            return BackendResponse(comment=f"❌ Error during Wizard Review: {str(e)[:100]}")
+        
     print("==== Incoming payload ====", file=sys.stderr)
     try:
         print(json.dumps(payload.model_dump(), indent=2), file=sys.stderr)
@@ -641,3 +649,38 @@ async def analyze_review(payload: ReviewPayload):
 
     # 5) Default: classification debug comment
     return BackendResponse(comment=format_debug_comment(payload, cls))
+
+
+def run_wizard_full_review(payload: ReviewPayload) -> str:
+    client = get_client()
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+    system_instructions = """
+    You are the 'ContextWizard' AI Reviewer. 
+    Your goal is to perform an autonomous code review of the provided changes.
+    
+    Rules:
+    1. Analyze the Diff Hunks and Changed Files provided in the context.
+    2. Identify bugs, security risks, or performance issues.
+    3. For each issue, provide:
+       - ### [TITLE]: A short, descriptive title of the problem.
+       - **Description**: A clear explanation of what is wrong and how to fix it.
+    4. Be concise and professional.
+    """
+    
+    ctx = build_llm_context(payload)
+    
+    def _call():
+        resp = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user", 
+                    parts=[types.Part(text=f"{system_instructions}\n\nCONTEXT:\n{ctx}")]
+                )
+            ],
+            config=types.GenerateContentConfig(temperature=0.3),
+        )
+        return resp.text
+
+    return gemini_call_with_retry("wizard_review", _call)
